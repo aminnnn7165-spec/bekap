@@ -237,11 +237,11 @@ def find_mysql_container():
 
 
 def create_zip_backup():
+    """Create a ZIP directly from mysqldump output to avoid an intermediate SQL file."""
     username, password, database = get_database_settings()
     container = find_mysql_container()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     work = Path(tempfile.mkdtemp(prefix="marzban-telegram-backup-"))
-    sql_file = work / "database.sql"
     zip_file = work / f"marzban_db_{stamp}.zip"
 
     log(f"شروع بکاپ دیتابیس {database} از کانتینر {container}")
@@ -261,27 +261,68 @@ def create_zip_backup():
         "-e", "DB_NAME=" + database,
         container, "sh", "-c", safe_shell,
     ]
+
+    started = time.monotonic()
+    raw_size = 0
+    proc = None
     try:
-        with sql_file.open("wb") as output:
-            result = subprocess.run(
-                command, input=(password + "\n").encode("utf-8"),
-                stdout=output, stderr=subprocess.PIPE, text=False
-            )
-        if result.returncode != 0:
-            err_text = (result.stderr or b"no details").decode("utf-8", "replace")
-            raise RuntimeError("خطای mysqldump: " + err_text[-2500:])
-        if not sql_file.is_file() or sql_file.stat().st_size == 0:
-            raise RuntimeError("خروجی SQL خالی است.")
+        # Level 1 is substantially faster than level 9 for large SQL dumps.
+        # mysqldump is streamed straight into ZIP, so no large .sql file is written.
+        with tempfile.TemporaryFile() as error_output:
+            with zipfile.ZipFile(
+                zip_file, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+            ) as archive:
+                member = zipfile.ZipInfo(f"marzban_{database}_{stamp}.sql")
+                member.compress_type = zipfile.ZIP_DEFLATED
+                with archive.open(member, "w", force_zip64=True) as zipped_sql:
+                    proc = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=error_output,
+                    )
+                    try:
+                        proc.stdin.write((password + "\n").encode("utf-8"))
+                        proc.stdin.close()
+                        while True:
+                            block = proc.stdout.read(1024 * 1024)
+                            if not block:
+                                break
+                            zipped_sql.write(block)
+                            raw_size += len(block)
+                        return_code = proc.wait()
+                    except Exception:
+                        proc.kill()
+                        proc.wait()
+                        raise
+                    finally:
+                        if proc.stdout:
+                            proc.stdout.close()
 
-        with zipfile.ZipFile(zip_file, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-            archive.write(sql_file, arcname=f"marzban_{database}_{stamp}.sql")
+            if return_code != 0:
+                error_output.seek(0)
+                err_text = error_output.read()[-2500:].decode("utf-8", "replace")
+                raise RuntimeError("خطای mysqldump: " + (err_text or "no details"))
+
+        if raw_size == 0 or not zip_file.is_file() or zip_file.stat().st_size == 0:
+            raise RuntimeError("خروجی بکاپ خالی است.")
+
+        # Check ZIP structure and member metadata without decompressing the whole dump again.
         with zipfile.ZipFile(zip_file, "r") as archive:
-            bad_member = archive.testzip()
-            if bad_member:
-                raise RuntimeError(f"فایل ZIP خراب است: {bad_member}")
+            members = archive.infolist()
+            if len(members) != 1 or members[0].file_size != raw_size:
+                raise RuntimeError("ساختار ZIP بکاپ معتبر نیست.")
 
-        return work, zip_file, stamp, database, sql_file.stat().st_size
+        zip_size = zip_file.stat().st_size
+        log(
+            f"ساخت ZIP تمام شد: SQL={raw_size / 1048576:.2f} MB, "
+            f"ZIP={zip_size / 1048576:.2f} MB, زمان={time.monotonic() - started:.1f} ثانیه"
+        )
+        return work, zip_file, stamp, database, raw_size
     except Exception:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         shutil.rmtree(work, ignore_errors=True)
         raise
 
@@ -336,8 +377,11 @@ def do_backup(cfg, notify=True):
                 f"ZIP: {zip_size / 1048576:.2f} MB\n"
                 f"Part: {index}/{total}"
             )
-            log(f"ارسال پارت {index}/{total} ({part.stat().st_size / 1048576:.2f} MB)")
+            part_size = part.stat().st_size
+            send_started = time.monotonic()
+            log(f"شروع ارسال پارت {index}/{total} ({part_size / 1048576:.2f} MB)")
             send_document(cfg["bot_token"], owner, part, caption)
+            log(f"ارسال پارت {index}/{total} تمام شد؛ زمان={time.monotonic() - send_started:.1f} ثانیه")
 
         completed = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cfg["last_backup_epoch"] = int(time.time())
